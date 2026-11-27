@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 from data import CATEGORIES
+from explain import explain_clause
 
 MODEL_DIR = "./sentiment-model"
 MAX_LENGTH = 128  # must match train.py
@@ -49,9 +50,18 @@ class CategoryScore(BaseModel):
     flagged: bool
 
 
+class TokenScore(BaseModel):
+    token: str
+    score: float  # signed, normalized to [-1, 1]; see explain.py
+
+
 class PredictionResponse(BaseModel):
     is_unfair: bool
     categories: list[CategoryScore]
+    # Only populated for flagged categories -- computing the gradient pass
+    # for all 8 on every request would be 8x the cost for 6+ explanations
+    # nobody asked for, since most clauses flag zero or one category.
+    explanations: dict[str, list[TokenScore]] = {}
 
 
 @app.post("/predict", response_model=PredictionResponse)
@@ -77,9 +87,16 @@ def predict(request: ClauseRequest):
         for i, name in enumerate(CATEGORIES)
     ]
 
+    explanations = {
+        category.category: [TokenScore(**entry) for entry in explain_clause(inputs, i, model, tokenizer)]
+        for i, category in enumerate(categories)
+        if category.flagged
+    }
+
     return PredictionResponse(
         is_unfair=any(c.flagged for c in categories),
         categories=categories,
+        explanations=explanations,
     )
 
 

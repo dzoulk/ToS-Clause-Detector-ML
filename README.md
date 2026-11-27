@@ -1,6 +1,9 @@
 # ToS Clause Detector
 
-This project fine-tunes DistilBERT to flag unfair clauses in Terms of Service documents, things like forced arbitration, unilateral changes to the contract, or a company reserving the right to remove your content without notice. It compares the model against a classical TF-IDF plus Logistic Regression baseline, and it benchmarks ONNX export with INT8 quantization for CPU inference.
+[![Lint](https://github.com/dzoulk/ToS-Clause-Detector-ML/actions/workflows/lint.yml/badge.svg)](https://github.com/dzoulk/ToS-Clause-Detector-ML/actions/workflows/lint.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+This project fine-tunes DistilBERT to flag unfair clauses in Terms of Service documents, things like forced arbitration, unilateral changes to the contract, or a company reserving the right to remove your content without notice. It compares the model against a classical TF-IDF plus Logistic Regression baseline, benchmarks ONNX export with INT8 quantization for CPU inference, and explains each flag with the words that actually drove it, via a gradient-based attribution method implemented from scratch.
 
 ## Dataset
 
@@ -39,6 +42,7 @@ The real takeaway here isn't that the transformer wins. It's that a naive multi-
 - `baseline.py` is the TF-IDF + One-vs-Rest Logistic Regression baseline
 - `train.py` fine-tunes `distilbert-base-uncased` with a class-weighted multi-label loss and saves the result to `./sentiment-model`
 - `serve.py` is a FastAPI endpoint that serves the fine-tuned model
+- `explain.py` computes gradient-based token attributions for why a clause was flagged
 - `optimize.py` handles ONNX export, INT8 quantization, and inference benchmarking
 - `requirements.txt` lists the dependencies
 
@@ -86,11 +90,52 @@ Which returns something like this:
     {"category": "Choice of law", "probability": 0.04, "flagged": false},
     {"category": "Jurisdiction", "probability": 0.06, "flagged": false},
     {"category": "Arbitration", "probability": 0.91, "flagged": true}
-  ]
+  ],
+  "explanations": {
+    "Arbitration": [
+      {"token": "you", "score": 1.0},
+      {"token": "dispute", "score": -0.91},
+      {"token": "arbitration", "score": 0.41},
+      {"token": "agree", "score": 0.32},
+      {"token": "binding", "score": 0.18}
+    ]
+  }
 }
 ```
 
 The per-category flag threshold is a runtime environment variable (`FLAG_THRESHOLD`, default 0.5) instead of a hardcoded value. How aggressively you want to flag clauses depends on whether missed unfair clauses or false alarms matter more for your use case, and this repo doesn't have a real downstream use case to optimize that against, so it's left configurable.
+
+## Explainability
+
+`/predict` also returns an `explanations` entry for every *flagged* category (not all 8 — most clauses flag zero or one, and the attribution pass is a full extra forward+backward through the model per category, so computing it for categories nobody flagged would be pure waste).
+
+The method is gradient x input: backprop the flagged category's logit to the input embeddings, then take the dot product of each token's gradient with its own embedding. That's a direct measure of how much nudging a token further in the direction it's already pointing would move the score — a simple, long-standing saliency method (the input-gradient family, going back to Simonyan et al.'s saliency maps), implemented here directly on top of `transformers`/`torch` rather than pulling in Captum or SHAP for something a single extra backward pass already gives you. WordPiece subwords (`arbitra` + `##tion`) are merged back into whole words by averaging their scores, and every score is normalized by the single largest `|score|` in the clause, so 1.0 (or -1.0) always marks whichever word mattered most, positive meaning it pushed the flag up and negative meaning it pushed against it.
+
+Full output for the example clause above, ranked by magnitude:
+
+```
+        you  +1.00
+    dispute  -0.91
+    resolve  -0.46
+arbitration  +0.41
+      agree  +0.32
+         to  +0.27
+        and  -0.25
+    through  -0.22
+    binding  +0.18
+      right  -0.17
+      trial  -0.09
+```
+
+Worth being honest about: this is the noisier end of attribution methods. "arbitration" and "binding" do score positive, as expected, but neither is the top-ranked token — a plain "you" is, and "dispute" scores almost as large but negative, i.e. the method claims the word most central to the whole sentence was *arguing against* the Arbitration flag. That's a known weakness of raw gradient x input on transformers; integrated gradients (averaging the gradient along a path from a baseline input instead of taking it at one point) is the standard fix, at the cost of needing dozens of forward/backward passes per explanation instead of one. Shipping the simpler, noisier method and saying so here is the same call this project made on the Arbitration precision problem: get something real in, then be specific about where it still falls short instead of implying it doesn't.
+
+## Limitations and future work
+
+Arbitration is still the weak category. Its precision sits at 0.16, meaning the model flags roughly five clauses as Arbitration for every one that actually belongs there, even after the square-root pos_weight dampening described above. The remaining fix probably isn't another loss-weighting pass — it's likely that Arbitration's probability distribution sits differently than the other seven categories after that correction, so a single global 0.5 cutoff doesn't suit it. Tuning a per-category threshold (or calibrating each category's probabilities separately before thresholding) is the natural next step, and it's one this repo hasn't tried yet.
+
+The explanation method has its own known weakness, covered in detail above: raw gradient x input is noisier than integrated gradients, and it shows on real examples. That's a deliberate scope choice (one backward pass instead of dozens), not an oversight, but it's the first thing to upgrade if the explanations need to be trustworthy rather than just directional.
+
+Test coverage is also uneven. `tests/` covers the serving layer and the explanation logic, both exercised against the real trained model, but `data.py`, `baseline.py`, `train.py`, and `optimize.py` have no tests at all, and CI only runs `ruff check`, not the test suite itself. Running the real pytest suite in CI would need the trained model artifact available to the runner, which is the main reason it isn't wired up yet.
 
 ## Tests
 
@@ -118,3 +163,7 @@ python optimize.py
 ```
 
 This exports the fine-tuned model to ONNX and applies dynamic INT8 quantization, then benchmarks PyTorch fp32, ONNX fp32, and ONNX int8 against each other on F1, on-disk size, and CPU latency. The full results and methodology notes, including a benchmarking pitfall around ONNX Runtime's default multi-threading, are in [optimization_results.md](optimization_results.md).
+
+## License
+
+MIT, see [LICENSE](LICENSE).
